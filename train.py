@@ -30,7 +30,7 @@ def train_step(
     generator: nn.Module,
     discriminator: nn.Module,
     truncated_vgg19: nn.Module,
-    content_loss_fn: nn.Module,
+    perceptual_loss_fn: nn.Module,
     pixel_loss_fn: nn.Module,
     adversarial_loss_fn: nn.Module,
     generator_optimizer: optim.Optimizer,
@@ -57,13 +57,22 @@ def train_step(
         with autocast(device, enabled=(generator_scaler is not None)):
             sr_img_tensor = generator(lr_img_tensor)
 
-            sr_img_tensor_normalized = convert_img(sr_img_tensor, "[-1, 1]", "imagenet")
-            hr_img_tensor_normalized = convert_img(hr_img_tensor, "[-1, 1]", "imagenet")
+            sr_img_tensor_imagenet = convert_img(sr_img_tensor, "[-1, 1]", "imagenet")
+            hr_img_tensor_imagenet = convert_img(hr_img_tensor, "[-1, 1]", "imagenet")
 
-            sr_img_tensor_in_vgg_space = truncated_vgg19(sr_img_tensor_normalized)
-            hr_img_tensor_in_vgg_space = truncated_vgg19(
-                hr_img_tensor_normalized
-            ).detach()
+            sr_img_features_tensor = truncated_vgg19(sr_img_tensor_imagenet)
+            hr_img_features_tensor = truncated_vgg19(hr_img_tensor_imagenet)
+
+            perceptual_loss = 0.0
+
+            for layer_name, weight in config.PERCEPTUAL_LOSS_LAYER_WEIGHTS.items():
+                sr_img_feature_tensor = sr_img_features_tensor[layer_name]
+                hr_img_feature_tensor = hr_img_features_tensor[layer_name].detach()
+
+                layer_loss = perceptual_loss_fn(
+                    sr_img_feature_tensor, hr_img_feature_tensor
+                )
+                perceptual_loss += weight * layer_loss
 
             hr_discriminated = discriminator(hr_img_tensor).detach()
             sr_discriminated = discriminator(sr_img_tensor)
@@ -85,14 +94,10 @@ def train_step(
                 )
             ) / 2
 
-            content_loss = content_loss_fn(
-                sr_img_tensor_in_vgg_space, hr_img_tensor_in_vgg_space
-            )
-
             pixel_loss = pixel_loss_fn(sr_img_tensor, hr_img_tensor)
 
             generator_loss = (
-                content_loss
+                config.PERCEPTUAL_LOSS_SCALING_VALUE * perceptual_loss
                 + config.ADVERSARIAL_LOSS_SCALING_VALUE * adversarial_loss
                 + config.PIXEL_LOSS_SCALING_VALUE * pixel_loss
             )
@@ -183,12 +188,12 @@ def validation_step(
     data_loader: DataLoader,
     generator: nn.Module,
     truncated_vgg19: nn.Module,
-    content_loss_fn: nn.Module,
+    perceptual_loss_fn: nn.Module,
     psnr_metric: PeakSignalNoiseRatio,
     ssim_metric: StructuralSimilarityIndexMeasure,
     device: Literal["cpu", "cuda"] = "cpu",
 ) -> tuple[float, float, float]:
-    total_content_loss = 0.0
+    total_perceptual_loss = 0.0
 
     generator.eval()
 
@@ -199,15 +204,22 @@ def validation_step(
 
             sr_img_tensor = generator(lr_img_tensor)
 
-            sr_img_tensor_normalized = convert_img(sr_img_tensor, "[-1, 1]", "imagenet")
-            hr_img_tensor_normalized = convert_img(hr_img_tensor, "[-1, 1]", "imagenet")
+            sr_img_tensor_imagenet = convert_img(sr_img_tensor, "[-1, 1]", "imagenet")
+            hr_img_tensor_imagenet = convert_img(hr_img_tensor, "[-1, 1]", "imagenet")
 
-            sr_img_tensor_in_vgg_space = truncated_vgg19(sr_img_tensor_normalized)
-            hr_img_tensor_in_vgg_space = truncated_vgg19(hr_img_tensor_normalized)
+            sr_img_features_tensor = truncated_vgg19(sr_img_tensor_imagenet)
+            hr_img_features_tensor = truncated_vgg19(hr_img_tensor_imagenet)
 
-            content_loss = content_loss_fn(
-                sr_img_tensor_in_vgg_space, hr_img_tensor_in_vgg_space
-            )
+            perceptual_loss = 0.0
+
+            for layer_name, weight in config.PERCEPTUAL_LOSS_LAYER_WEIGHTS.items():
+                sr_img_feature_tensor = sr_img_features_tensor[layer_name]
+                hr_img_feature_tensor = hr_img_features_tensor[layer_name].detach()
+
+                layer_loss = perceptual_loss_fn(
+                    sr_img_feature_tensor, hr_img_feature_tensor
+                )
+                perceptual_loss += weight * layer_loss
 
             y_hr_tensor = convert_img(hr_img_tensor, "[-1, 1]", "y-channel")
             y_sr_tensor = convert_img(sr_img_tensor, "[-1, 1]", "y-channel")
@@ -219,16 +231,16 @@ def validation_step(
             psnr_metric.update(y_sr_tensor, y_hr_tensor)  # type: ignore
             ssim_metric.update(y_sr_tensor, y_hr_tensor)  # type: ignore
 
-            total_content_loss += content_loss.item()
+            total_perceptual_loss += perceptual_loss
 
-        total_content_loss /= len(data_loader)
+        total_perceptual_loss /= len(data_loader)
         total_psnr = psnr_metric.compute().item()  # type: ignore
         total_ssim = ssim_metric.compute().item()  # type: ignore
 
         psnr_metric.reset()
         ssim_metric.reset()
 
-    return total_content_loss, total_psnr, total_ssim
+    return total_perceptual_loss, total_psnr, total_ssim
 
 
 def train(
@@ -237,7 +249,7 @@ def train(
     generator: nn.Module,
     discriminator: nn.Module,
     truncated_vgg19: nn.Module,
-    content_loss_fn: nn.Module,
+    perceptual_loss_fn: nn.Module,
     pixel_loss_fn: nn.Module,
     adversarial_loss_fn: nn.Module,
     generator_optimizer: optim.Optimizer,
@@ -307,7 +319,7 @@ def train(
                 generator=generator,
                 discriminator=discriminator,
                 truncated_vgg19=truncated_vgg19,
-                content_loss_fn=content_loss_fn,
+                perceptual_loss_fn=perceptual_loss_fn,
                 pixel_loss_fn=pixel_loss_fn,
                 adversarial_loss_fn=adversarial_loss_fn,
                 generator_optimizer=generator_optimizer,
@@ -324,7 +336,7 @@ def train(
                     data_loader=val_data_loader,
                     generator=generator,
                     truncated_vgg19=truncated_vgg19,
-                    content_loss_fn=content_loss_fn,
+                    perceptual_loss_fn=perceptual_loss_fn,
                     psnr_metric=psnr_metric,
                     ssim_metric=ssim_metric,
                     device=device,
@@ -463,15 +475,12 @@ def main() -> None:
     ).to(device)
 
     discriminator = Discriminator(
-        channels_count=config.DISCRIMINATOR_CHANNELS_COUNT,
-        kernel_size=config.DISCRIMINATOR_KERNEL_SIZE,
-        conv_blocks_count=config.DISCRIMINATOR_CONV_BLOCKS_COUNT,
-        linear_layer_size=config.DISCRIMINATOR_LINEAR_LAYER_SIZE,
+        in_channels=3, channels_count=config.DISCRIMINATOR_CHANNELS_COUNT
     ).to(device)
 
     truncated_vgg19 = TruncatedVGG19().to(device)
 
-    content_loss_fn = nn.L1Loss()
+    perceptual_loss_fn = nn.L1Loss()
     pixel_loss_fn = nn.L1Loss()
     adversarial_loss_fn = nn.BCEWithLogitsLoss()
 
@@ -573,7 +582,7 @@ def main() -> None:
         generator=generator,
         discriminator=discriminator,
         truncated_vgg19=truncated_vgg19,
-        content_loss_fn=content_loss_fn,
+        perceptual_loss_fn=perceptual_loss_fn,
         pixel_loss_fn=pixel_loss_fn,
         adversarial_loss_fn=adversarial_loss_fn,
         generator_optimizer=generator_optimizer,
