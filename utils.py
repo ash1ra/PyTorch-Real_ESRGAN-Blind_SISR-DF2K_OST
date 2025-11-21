@@ -94,6 +94,19 @@ class ImgDegradationPipeline:
         self.gray_noise_prob_2 = config.GRAY_NOISE_PROBABILITY_2
         self.jpeg_range_2 = config.JPEG_RANGE_2
 
+    def _calc_rotated_sigma_matrix(self, sigma_x, sigma_y, angle):
+        cos_theta = np.cos(angle)
+        sin_theta = np.sin(angle)
+
+        R = np.array([[cos_theta, -sin_theta], [sin_theta, cos_theta]])
+
+        Sigma = np.array([[sigma_x**2, 0], [0, sigma_y**2]])
+
+        Cov = R @ Sigma @ R.T
+
+        inv_Cov = np.linalg.inv(Cov)
+        return inv_Cov
+
     def _mesh_grid(self, kernel_size):
         ax = np.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
         xx, yy = np.meshgrid(ax, ax)
@@ -105,12 +118,20 @@ class ImgDegradationPipeline:
         ).reshape(kernel_size, kernel_size, 2)
         return xy, xx, yy
 
-    def _get_gaussian_kernel(self, kernel_size, sigma, grid=None):
+    def _get_gaussian_kernel(self, kernel_size, sigma_x, sigma_y, angle, grid=None):
         if grid is None:
             _, xx, yy = self._mesh_grid(kernel_size)
         else:
             xx, yy = grid
-        kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+
+        inv_cov = self._calc_rotated_sigma_matrix(sigma_x, sigma_y, angle)
+        a = inv_cov[0, 0]
+        b = inv_cov[0, 1]
+        c = inv_cov[1, 1]
+
+        exponent = -0.5 * (a * xx**2 + 2 * b * xx * yy + c * yy**2)
+        kernel = np.exp(exponent)
+
         return kernel / np.sum(kernel)
 
     def _get_generalized_gaussian_kernel(self, kernel_size, sigma, beta, grid=None):
@@ -155,18 +176,33 @@ class ImgDegradationPipeline:
         _, xx, yy = self._mesh_grid(kernel_size)
         grid = (xx, yy)
 
-        sigma = random.uniform(sigma_range[0], sigma_range[1])
+        sigma_x = random.uniform(sigma_range[0], sigma_range[1])
+
+        if random.random() < 0.5:
+            sigma_y = sigma_x
+            angle = 0
+        else:
+            sigma_y = random.uniform(sigma_range[0], sigma_range[1])
+            angle = random.uniform(0, 2 * np.pi)
 
         if blur_type == "gaussian":
-            kernel = self._get_gaussian_kernel(kernel_size, sigma, grid)
+            kernel = self._get_gaussian_kernel(
+                kernel_size, sigma_x, sigma_y, angle, grid
+            )
+
         elif blur_type == "generalized":
             beta = random.uniform(self.betag_range[0], self.betag_range[1])
+
             kernel = self._get_generalized_gaussian_kernel(
-                kernel_size, sigma, beta, grid
+                kernel_size,
+                sigma_x,
+                beta,
+                grid,
             )
+
         else:
             beta = random.uniform(self.betap_range[0], self.betap_range[1])
-            kernel = self._get_plateau_kernel(kernel_size, sigma, beta, grid)
+            kernel = self._get_plateau_kernel(kernel_size, sigma_x, beta, grid)
 
         return kernel
 
