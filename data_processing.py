@@ -4,11 +4,11 @@ from typing import Literal
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
-from utils import create_hr_and_lr_imgs
 
-from config import create_logger
+import config
+from utils import ImgDegradationPipeline, create_hr_and_lr_imgs
 
-logger = create_logger("INFO", __file__)
+logger = config.create_logger("INFO", __file__)
 
 
 class SRDataset(Dataset):
@@ -24,6 +24,8 @@ class SRDataset(Dataset):
         self.crop_size = crop_size
         self.test_mode = test_mode
         self.imgs = []
+
+        self.img_degradation_pipeline = ImgDegradationPipeline(config.SCALING_FACTOR)
 
         data_path = Path(data_path)
 
@@ -68,4 +70,5 @@ class SRDataset(Dataset):
             scaling_factor=self.scaling_factor,
             crop_size=self.crop_size,
             test_mode=self.test_mode,
+            img_degradation_pipeline=self.img_degradation_pipeline,
         )

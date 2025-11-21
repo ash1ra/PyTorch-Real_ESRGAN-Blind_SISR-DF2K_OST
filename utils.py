@@ -1,14 +1,18 @@
 import json
+import random
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, overload
 
+import cv2
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from safetensors.torch import load_file, save_file
+from scipy import special
 from torch import Tensor, nn, optim
 from torch.amp import GradScaler
 from torch.optim.lr_scheduler import MultiStepLR
@@ -16,6 +20,8 @@ from torchvision.io import decode_image
 from torchvision.transforms import v2 as transforms
 
 import config
+
+logger = config.create_logger("INFO", __file__)
 
 
 @dataclass
@@ -30,7 +36,255 @@ class Metrics:
     generator_val_ssims: list[float] = field(default_factory=list)
 
 
-logger = config.create_logger("INFO", __file__)
+class ImgDegradationPipeline:
+    def __init__(self, scaling_factor: int):
+        self.scaling_factor = scaling_factor
+
+        self.blur_kernel_size_list = config.BLUR_KERNEL_SIZE_LIST
+        self.blur_kernel_prob = config.BLUR_KERNEL_PROBABILITY
+        self.betag_range = config.BETAG_RANGE
+        self.betap_range = config.BETAP_RANGE
+        self.sinc_prob = config.SINC_PROBABILITY
+        self.sinc_kernel_size = config.SINC_KERNEL_SIZE
+        self.omega_range = config.OMEGA_RANGE
+        self.second_blur_prob = config.SECOND_BLUR_PROBABILITY
+
+        self.blur_sigma_range = config.BLUR_SIGMA_RANGE
+        self.resize_prob = config.RESIZE_PROBABILITY
+        self.resize_range = config.RESIZE_RANGE
+        self.gaussian_noise_prob = config.GAUSSIAN_NOISE_PROBABILITY
+        self.noise_range = config.NOISE_RANGE
+        self.poisson_scale_range = config.POISSON_SCALE_RANGE
+        self.gray_noise_prob = config.GRAY_NOISE_PROBABILITY
+        self.jpeg_range = config.JPEG_RANGE
+
+        self.blur_sigma_range_2 = config.BLUR_SIGMA_RANGE_2
+        self.resize_prob_2 = config.RESIZE_PROBABILITY_2
+        self.resize_range_2 = config.RESIZE_RANGE_2
+        self.gaussian_noise_prob_2 = config.GAUSSIAN_NOISE_PROBABILITY_2
+        self.noise_range_2 = config.NOISE_RANGE_2
+        self.poisson_scale_range_2 = config.POISSON_SCALE_RANGE_2
+        self.gray_noise_prob_2 = config.GRAY_NOISE_PROBABILITY_2
+        self.jpeg_range_2 = config.JPEG_RANGE_2
+
+    def _mesh_grid(self, kernel_size):
+        ax = np.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
+        xx, yy = np.meshgrid(ax, ax)
+        xy = np.hstack(
+            (
+                xx.reshape((kernel_size * kernel_size, 1)),
+                yy.reshape((kernel_size * kernel_size, 1)),
+            )
+        ).reshape(kernel_size, kernel_size, 2)
+        return xy, xx, yy
+
+    def _get_gaussian_kernel(self, kernel_size, sigma, grid=None):
+        if grid is None:
+            _, xx, yy = self._mesh_grid(kernel_size)
+        else:
+            xx, yy = grid
+        kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+        return kernel / np.sum(kernel)
+
+    def _get_generalized_gaussian_kernel(self, kernel_size, sigma, beta, grid=None):
+        if grid is None:
+            _, xx, yy = self._mesh_grid(kernel_size)
+        else:
+            xx, yy = grid
+        kernel = np.exp(
+            -0.5 * (np.power(np.abs(xx) ** 2 + np.abs(yy) ** 2, beta / 2)) / sigma**2
+        )
+        return kernel / np.sum(kernel)
+
+    def _get_plateau_kernel(self, kernel_size, sigma, beta, grid=None):
+        if grid is None:
+            _, xx, yy = self._mesh_grid(kernel_size)
+        else:
+            xx, yy = grid
+        r = np.sqrt(xx**2 + yy**2)
+        kernel = np.reciprocal(np.power(r + 1e-5, beta))
+        return kernel / np.sum(kernel)
+
+    def _get_sinc_kernel(self, kernel_size, omega_c):
+        _, xx, yy = self._mesh_grid(kernel_size)
+        dist = np.sqrt(xx**2 + yy**2)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            kernel = 2 * special.j1(omega_c * dist) / (omega_c * dist)
+            kernel[dist == 0] = 1.0
+
+        window_1d = np.kaiser(kernel_size, 14)
+        window_2d = np.outer(window_1d, window_1d)
+        kernel = kernel * window_2d
+
+        return kernel / np.sum(kernel)
+
+    def _generate_random_blur_kernel(self, sigma_range):
+        kernel_size = random.choice(self.blur_kernel_size_list)
+        blur_type = random.choices(
+            ["gaussian", "generalized", "plateau"], self.blur_kernel_prob
+        )[0]
+
+        _, xx, yy = self._mesh_grid(kernel_size)
+        grid = (xx, yy)
+
+        sigma = random.uniform(sigma_range[0], sigma_range[1])
+
+        if blur_type == "gaussian":
+            kernel = self._get_gaussian_kernel(kernel_size, sigma, grid)
+        elif blur_type == "generalized":
+            beta = random.uniform(self.betag_range[0], self.betag_range[1])
+            kernel = self._get_generalized_gaussian_kernel(
+                kernel_size, sigma, beta, grid
+            )
+        else:
+            beta = random.uniform(self.betap_range[0], self.betap_range[1])
+            kernel = self._get_plateau_kernel(kernel_size, sigma, beta, grid)
+
+        return kernel
+
+    def _generate_sinc_kernel(self):
+        kernel_size = self.sinc_kernel_size
+        omega_c = random.uniform(self.omega_range[0], self.omega_range[1])
+        kernel = self._get_sinc_kernel(kernel_size, omega_c)
+        return kernel
+
+    def _apply_resize(self, img, resize_prob, resize_range):
+        h, w = img.shape[:2]
+        resize_type = random.choices(["up", "down", "keep"], resize_prob)[0]
+
+        if resize_type == "up":
+            scale = random.uniform(1.0, resize_range[1])
+        elif resize_type == "down":
+            scale = random.uniform(resize_range[0], 1.0)
+        else:
+            scale = 1.0
+
+        if scale == 1.0:
+            return img
+
+        interpolation = random.choice(
+            [
+                cv2.INTER_LINEAR,
+                cv2.INTER_CUBIC,
+                cv2.INTER_AREA,
+            ]
+        )
+
+        return cv2.resize(
+            img, (int(w * scale), int(h * scale)), interpolation=interpolation
+        )
+
+    def _apply_noise(
+        self, img, gaussian_prob, noise_range, poisson_scale_range, gray_noise_prob
+    ):
+        h, w, c = img.shape
+
+        use_gray_noise = random.random() < gray_noise_prob
+
+        if random.random() < gaussian_prob:
+            sigma = random.uniform(noise_range[0], noise_range[1])
+            if use_gray_noise:
+                noise = np.random.normal(0, sigma, (h, w, 1))
+                noise = np.repeat(noise, c, axis=2)
+            else:
+                noise = np.random.normal(0, sigma, (h, w, c))
+
+            img = img.astype(np.float32) + noise
+        else:
+            scale = random.uniform(poisson_scale_range[0], poisson_scale_range[1])
+            img = img.astype(np.float32)
+
+            if use_gray_noise:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                vals = len(np.unique(gray))
+                vals = 2 ** np.ceil(np.log2(vals))
+
+                noise = np.random.poisson(gray * scale) / scale - gray
+                noise = noise[:, :, np.newaxis]
+                noise = np.repeat(noise, c, axis=2)
+                img = img + noise
+            else:
+                noise = np.random.poisson(img * scale) / scale - img
+                img = img + noise
+
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+    def _apply_jpeg(self, img, jpeg_range):
+        quality = random.randint(jpeg_range[0], jpeg_range[1])
+        _, enc_img = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        img = cv2.imdecode(enc_img, 1)
+        return img
+
+    def process(self, img_rgb: np.ndarray) -> np.ndarray:
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR).astype(np.float32)
+
+        kernel1 = self._generate_random_blur_kernel(sigma_range=self.blur_sigma_range)
+        img_bgr = cv2.filter2D(img_bgr, -1, kernel1, borderType=cv2.BORDER_REFLECT)
+
+        img_bgr = self._apply_resize(
+            img_bgr, resize_prob=self.resize_prob, resize_range=self.resize_range
+        )
+
+        img_bgr = self._apply_noise(
+            img_bgr,
+            gaussian_prob=self.gaussian_noise_prob,
+            noise_range=self.noise_range,
+            poisson_scale_range=self.poisson_scale_range,
+            gray_noise_prob=self.gray_noise_prob,
+        )
+
+        img_bgr = self._apply_jpeg(img_bgr, jpeg_range=self.jpeg_range)
+
+        if random.random() < self.second_blur_prob:
+            kernel2 = self._generate_random_blur_kernel(
+                sigma_range=self.blur_sigma_range_2
+            )
+            img_bgr = cv2.filter2D(img_bgr, -1, kernel2, borderType=cv2.BORDER_REFLECT)
+
+            img_bgr = self._apply_resize(
+                img_bgr,
+                resize_prob=self.resize_prob_2,
+                resize_range=self.resize_range_2,
+            )
+
+            img_bgr = self._apply_noise(
+                img_bgr,
+                gaussian_prob=self.gaussian_noise_prob_2,
+                noise_range=self.noise_range_2,
+                poisson_scale_range=self.poisson_scale_range_2,
+                gray_noise_prob=self.gray_noise_prob_2,
+            )
+
+            if random.random() < 0.5:
+                if random.random() < self.sinc_prob:
+                    sinc_kernel = self._generate_sinc_kernel()
+                    img_bgr = cv2.filter2D(
+                        img_bgr, -1, sinc_kernel, borderType=cv2.BORDER_REFLECT
+                    )
+
+                img_bgr = self._apply_jpeg(img_bgr, jpeg_range=self.jpeg_range_2)
+            else:
+                img_bgr = self._apply_jpeg(img_bgr, jpeg_range=self.jpeg_range_2)
+
+                if random.random() < self.sinc_prob:
+                    sinc_kernel = self._generate_sinc_kernel()
+                    img_bgr = cv2.filter2D(
+                        img_bgr, -1, sinc_kernel, borderType=cv2.BORDER_REFLECT
+                    )
+
+        orig_h, orig_w = img_rgb.shape[:2]
+        target_h = orig_h // self.scaling_factor
+        target_w = orig_w // self.scaling_factor
+
+        out_bgr = cv2.resize(
+            img_bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
+        )
+
+        out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+        out_rgb = np.clip(out_rgb, 0, 255).astype(np.uint8)
+
+        return out_rgb
 
 
 def create_hr_and_lr_imgs(
@@ -38,6 +292,7 @@ def create_hr_and_lr_imgs(
     scaling_factor: Literal[2, 4, 8],
     crop_size: int | None = None,
     test_mode: bool = False,
+    img_degradation_pipeline: ImgDegradationPipeline | None = None,
 ) -> tuple[Tensor, Tensor]:
     img_tensor = decode_image(Path(img_path).__fspath__())
 
@@ -72,18 +327,27 @@ def create_hr_and_lr_imgs(
 
         hr_img_tensor = augmentation_transforms(img_tensor)
 
-    lr_transforms = transforms.Compose(
-        [
-            transforms.Resize(
-                size=(
-                    hr_img_tensor.shape[1] // scaling_factor,
-                    hr_img_tensor.shape[2] // scaling_factor,
-                ),
-                interpolation=transforms.InterpolationMode.BICUBIC,
-                antialias=True,
-            )
-        ]
-    )
+    if test_mode:
+        lr_transforms = transforms.Compose(
+            [
+                transforms.Resize(
+                    size=(
+                        hr_img_tensor.shape[1] // scaling_factor,
+                        hr_img_tensor.shape[2] // scaling_factor,
+                    ),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                    antialias=True,
+                )
+            ]
+        )
+        lr_img_tensor = lr_transforms(hr_img_tensor)
+    elif img_degradation_pipeline:
+        hr_img_np = hr_img_tensor.permute(1, 2, 0).numpy()
+        lr_img_np = img_degradation_pipeline.process(hr_img_np)
+        lr_img_tensor = torch.from_numpy(lr_img_np).permute(2, 0, 1)
+    else:
+        logger.error("Use either test_mode=True or pass the img_degradation_pipeline")
+        raise NotImplementedError
 
     normalize_transforms = transforms.Compose(
         [
@@ -91,8 +355,6 @@ def create_hr_and_lr_imgs(
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
     )
-
-    lr_img_tensor = lr_transforms(hr_img_tensor)
 
     hr_img_tensor = normalize_transforms(hr_img_tensor)
     lr_img_tensor = normalize_transforms(lr_img_tensor)
