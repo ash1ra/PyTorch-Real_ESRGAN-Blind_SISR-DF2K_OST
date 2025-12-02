@@ -1,7 +1,7 @@
 [project]
-name = "pytorch-real-esrgan-sisr-df2k-ost"
+name = "-real-esrgan"
 version = "0.1.0"
-description = "PyTorch Realistic Enhanced Super Resolution Generative Adversarial Network trained on the DF2K_OST dataset"
+description = "Realistic Enhanced Super Resolution Generative Adversarial Network trained on the DF2K_OST dataset using PyTorch"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
